@@ -1,0 +1,436 @@
+% ICASSP 2027 manuscript. Compile RCS.tex with pdfLaTeX + BibTeX.
+\documentclass[letterpaper]{article}
+\usepackage{spconf}
+\usepackage{amsmath,amssymb,graphicx}
+\usepackage{booktabs}
+\usepackage{cite}
+\usepackage{url}
+\usepackage{iftex}
+\ifPDFTeX
+  \usepackage[utf8]{inputenc}
+  \usepackage[T5,T1]{fontenc}
+  \newcommand{\vi}[1]{{\fontencoding{T5}\selectfont #1}}
+\else
+  \usepackage{fontspec}
+  \setmainfont{texgyretermes-regular.otf}[
+    BoldFont=texgyretermes-bold.otf,
+    ItalicFont=texgyretermes-italic.otf,
+    BoldItalicFont=texgyretermes-bolditalic.otf]
+  \newcommand{\vi}[1]{#1}
+\fi
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,positioning}
+\usepackage{pgfplots}
+\pgfplotsset{compat=1.18}
+\usepackage[hidelinks]{hyperref}
+
+\newcommand{\method}{RCS}
+\newcommand{\TR}{TR}
+\newcommand{\rep}{\ensuremath{\mathrm{Rep}}}
+\newcommand{\ins}{\ensuremath{\mathrm{Ins}}}
+\DeclareMathOperator*{\argmax}{arg\,max}
+\newcommand{\cE}{\mathcal{E}}
+\newcommand{\cC}{\mathcal{C}}
+\newcommand{\cV}{\mathcal{V}}
+\newcommand{\cA}{\mathcal{A}}
+\newcommand{\cD}{\mathcal{D}}
+\newcommand{\cS}{\mathcal{S}}
+
+\title{As Speakers Would Switch:\\
+In-Place Editing and Native-Accent Respelling for Code-Switched ASR}
+\name{Tien Dat Bui\textsuperscript{1},
+Van Dat Le\textsuperscript{1},
+Ngoc Thuan Tran\textsuperscript{1},
+Nhat Minh Le\textsuperscript{1},
+Van Hai Do\textsuperscript{2}\sthanks{Corresponding author}}
+\address{\textsuperscript{1}Viettel AI, Viettel Group, Vietnam\\
+\textsuperscript{2}Thuyloi University, Hanoi, Vietnam}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Automatic speech recognition remains weak on code-switched speech, largely
+because natural code-switched data are scarce and existing text-generation
+methods are not natural enough. Text-to-speech augmentation is cheaper, but
+is bounded by the text it renders: canonical synthesis cannot reproduce the
+diverse, matrix-language-adapted pronunciations that code-switching exhibits
+in practice. We present RCS, which takes only monolingual audio and a set of
+code-switching terms and generates natural, logically coherent code-switched
+data for a new domain while reusing the colloquial style of the
+matrix-language transcripts; a companion spelling augmentation models the
+pronunciation variants of switched terms. Applied to Vietnamese--English,
+RCS lowers WER by 22\% relative on both Whisper and Conformer-CTC and raises
+term recall by 55\% in domain, with gains carrying to out-of-domain terms
+absent from the catalog (+50\% on Whisper and +138\% on Conformer-CTC).
+Its synthetic text is the closest to real code-switched speech among the
+compared generators, with a masked PPL gap of 0.07 versus 0.17 and 0.68.
+\end{abstract}
+\begin{keywords}
+code-switching, speech recognition, data augmentation, text-to-speech,
+large language models
+\end{keywords}
+
+\section{Introduction}
+\label{sec:intro}
+Code-switching (CS) remains difficult for automatic speech recognition
+(ASR), especially when lexically sparse names, products, and technical
+terms are inserted into matrix-language
+speech~\cite{zhou2026sorry,liu2026lens}. These terms are often the most
+informative words in an utterance, so errors on them are
+disproportionately costly~\cite{ugan2025pier}. In deployment the terms
+that matter are largely known in advance, but the list changes over time,
+while natural CS corpora remain limited and
+domain-specific~\cite{nguyen2026vimedcss}; recording new speech for every
+new term is impractical, making augmentation attractive.
+
+Text-side augmentation generates CS text and synthesizes it with
+TTS~\cite{yan2025csfleurs}, evolving from rule-based substitution under
+linguistic constraints~\cite{pratapa2018} and GAN-based
+generation~\cite{chang2019gan} to LLM
+prompting~\cite{hu2023llmtext,singh2025leveraging,alharbi2024leveraging}
+and constrained decoding~\cite{kuwanto2024,liu2026lens}; contextual
+biasing~\cite{pundak2018deep,sun2021tree} instead injects known terms at
+decoding time and is complementary to it. Two limitations remain. First,
+full generation or rewriting replaces the surrounding conversational
+register and lets the LLM choose an uncontrolled embedded vocabulary, and
+its written-style output loses colloquial speech patterns. Second,
+canonical embedded-language TTS
+ignores the matrix-language-adapted pronunciations that bilingual
+speakers routinely produce: embedded items undergo L1-conditioned
+phonological transfer and deviate from their dictionary form.
+Spelling augmentation is a natural
+remedy, encoding these variants as phonetically plausible alternative
+spellings, and prior work shows that perturbing reference transcriptions
+with similar-sounding spellings improves rare-word
+robustness~\cite{huang2024perturb} and that LLM-driven phonetic respelling
+broadens lexical and phonetic coverage~\cite{yamashita2026synthetic}.
+
+We propose \method{} (\textbf{R}ealistic \textbf{C}ontext
+\textbf{S}ynthesis), instantiated here with Vietnamese as the matrix
+language and English as the embedded language: it preserves each real
+Vietnamese transcript and edits only selected switch positions. We make
+two contributions: (1) \emph{catalog-grounded text variants}, where an
+LLM proposes plausible replacement/insertion slots grounded to a curated
+term catalog, so a single transcript yields many controlled CS variants
+without asking the LLM to invent the English term, and new terms can be
+added without new speech or new slot proposals; and (2) \emph{respelling
+augmentation}, where embedded terms are stochastically rendered with
+Vietnamese-adapted spellings before TTS while training labels remain
+canonical.
+
+\begin{figure*}[t]
+    \centering
+    \includegraphics[width=\textwidth]{rcs_pipeline_v2 (1).pdf}
+    \caption{RCS separates switch-location proposal from catalog-based
+    term filling. Respelling changes the TTS input $z$, while the ASR
+    label $y$ remains canonical. All text outside the selected edits is
+    preserved; the source recording supplies the speaker reference.}
+    \label{fig:pipeline}
+\end{figure*}
+
+\section{Method}
+\label{sec:method}
+
+\method{} edits real transcripts in two stages (catalog-grounded slot editing and optional respelling) before synthesis (Fig.~\ref{fig:pipeline}).
+
+\subsection{Problem formulation}
+Let $\cD_{\rm mono}=\{(x_i,T_i)\}_{i=1}^{N}$ be a monolingual matrix-language corpus with transcripts $T=(w_1,\ldots,w_n)$. A term catalog $\cE=\{(c,d_c,\cV_c)\}$ associates each category $c$ with a one-line description $d_c$ and a set of values $\cV_c$ (e.g., $\cV_{\rm tech}=\{$iphone, macbook, server$\}$). \method{} is a stochastic map $T\mapsto(y,z)$ that produces a CS label $y$ and a synthesis string $z$, yielding a synthetic pair $(\tilde x,y)$ with $\tilde x=\mathrm{TTS}(z;\,x)$, where the source recording $x$ serves as speaker reference. The label is the source transcript with at most $K$ localized edits applied in place,
+\begin{equation}
+  y = T \oplus \{(a_k,e_k)\}_{k=1}^{K}, \qquad e_k\in\textstyle\bigcup_{c}\cV_c,
+  \label{eq:edit}
+\end{equation}
+where $a_k$ is either a span to be replaced (\rep) or an insertion anchor (\ins), and $\oplus$ applies the non-overlapping edits. Everything outside the $K$ edited positions, including disfluencies and discourse markers, is copied from the real transcript. An ASR model is finally trained on $\cD_{\rm mono}$ together with the synthetic set $\cD_{\rm syn}$.
+
+
+
+\subsection{LLM-guided slot editing}
+Given $T$, an LLM returns a set of proposals $P(T)=\{p_j\}$ with $p_j=(o_j,a_j,t_j,\delta_j)$: an operation $o_j\in\{\rep,\ins\}$, a span or anchor $a_j$, a free-form semantic tag $t_j$, and a short description $\delta_j$.We use Gemini~2.5 Flash with a chain-of-thought prompt: the model first
+identifies concrete, nameable spans and assigns each an entity type, preferring \rep{} and falling back to a single-word \ins{} only when no replaceable span exists. It then rejects proposals that change the
+grammatical role of the span, alter the meaning, or target abstract emotion and state words that bilingual speakers essentially never switch, before emitting a JSON list of proposals. The LLM never writes the CS sentence and never chooses the English term; it contributes span selection and grammatical judgment only.
+
+\subsection{Catalog grounding and variant expansion}
+Free-form tags are unstable across calls (\textsc{SportsClub}, \textsc{FootballTeam}, and \textsc{TeamName} denote one class), and the terms the LLM volunteers are not always real. Each proposal is therefore grounded in $\cE$ by semantic retrieval,
+\begin{equation}
+  \hat c_j=\argmax_{c\in\cE}\cos\!\big(\phi(t_j\Vert\delta_j),\,\phi(c\Vert d_c\Vert\cV_c)\big),
+  \label{eq:ground}
+\end{equation}
+where $\phi$ is a general-purpose text embedding model (gemini-embedding-001) and $\Vert$ denotes concatenation. A slot is admitted only if the maximum similarity exceeds a threshold $\tau$; no category is ever created on the fly. Denoting the admitted slots by $\cA(T)$, the variant set is
+\begin{equation}
+\begin{aligned}
+\mathcal{V}(T)
+= \{\,T \oplus \{(a_j,e_j)\}_{j\in S}:\;&
+S \subseteq A(T),\ |S|\le K,\\
+& e_j\in V_{\hat c_j}\,\},
+\end{aligned}
+\label{eq:variant}
+\end{equation}
+over non-overlapping subsets $S$, so that
+\[
+|\mathcal{V}(T)|
+=
+\sum_{S} \prod_{j\in S} |V_{\hat c_j}|,
+\]
+where the sum is over all non-overlapping $S\subseteq A(T)$ with $|S|\le K$.
+Diversity thus accumulates along three axes (alternative values
+within a category, alternative switch locations, and both \textsc{Rep} and \textsc{Ins}), and it is bounded by the richness of the catalog rather than by the generator. We draw $M$ variants per transcript without replacement. Because admitted slots and their categories are cached, a new term added to $\cV_c$ reuses every cached slot of category $c$ (over 10k for city names in our corpus) and needs only one respelling call (Sec.~\ref{sec:respell}), with no new speech or slot proposals.
+\begin{table*}[t]
+  \centering
+  \caption{Text-distribution and diversity of 10k outputs per
+  generator vs.\ length-matched real CS windows; the real-CS row is
+  the reference for all columns and $\dagger$ marks CS-span-masked
+  metrics. Func.\ sw.\ = function-word switching (\%).}
+  \label{tab:text}
+  \small
+  \setlength{\tabcolsep}{4pt}
+  \begin{tabular}{@{}l ccccccc@{}}
+    \toprule
+    Method & PPL gap$^\dagger\downarrow$ & CMI gap$\downarrow$
+    & MAUVE$\uparrow$ & C2ST$^\dagger$ & Func. sw.
+    & Vendi & $\Delta$Self-BLEU$^\dagger$\\
+    \midrule
+    Real CS speech & 0 & 0 & 1.00 & 0.50 & 0.3 & 4.43 & 0\\
+    LLM from scratch & 0.68 & 1.22 & 0.03 & 0.98 & 3.7 & 3.69 & +10.7\\
+    Transformation~\cite{liu2026lens}
+    & 0.17 & 7.49 & 0.21 & 0.77 & 26.0 & 4.17 & +7.6\\
+    RCS & \textbf{0.07} & \textbf{1.13} & \textbf{0.36}
+    & \textbf{0.73} & \textbf{0.2} & \textbf{4.39} & \textbf{$-$0.9}\\
+    \bottomrule
+  \end{tabular}
+\end{table*}
+\subsection{Phonological spelling augmentation}
+\label{sec:respell}
+For each catalog value $e$, Gemini~2.5 Flash generates once, offline, a small set of Vietnamese-adapted spellings $\cS(e)=\{s_1,\dots,s_{K_e}\}$ by reasoning from English orthography and pronunciation towards Vietnamese graphemes, optionally with tone marks (e.g., \emph{server}$\rightarrow$\vi{\{sơ-vơ, xơ-vơ\}}, \emph{API}$\rightarrow$\vi{\{ây-pi-ai\}}). Because respellings live at catalog level, their cost is independent of corpus size. Respelling is decided per utterance: with probability $\rho$ the synthesis string $z$ is $y$ with every term $e_k$ replaced by a sampled $s_k\sim\mathcal{U}(\cS(e_k))$, and otherwise $z=y$; the label $y$ always keeps the canonical form. The respelling rate $\rho$ is thus the fraction of synthetic utterances rendered from respelled text ($\rho=0$: canonical TTS; $\rho=1$: always respelled).
+
+Each $z$ is then synthesized end-to-end with the multilingual zero-shot TTS model OmniVoice~\cite{zhu2026omnivoice}, using the source recording as speaker prompt. A lightweight ASR check discards utterances whose recognition deviates from $z$ by more than a threshold, removing gross synthesis failures. The retained pairs form $\cD_{\rm syn}$.
+
+\section{Experimental setup}
+\label{sec:setup}
+\begin{table}[t]
+  \centering
+  \caption{Training and evaluation data. EN\%: share of English
+  words; CMI: mean code-mixing index; Terms: distinct CS terms.}
+  \label{tab:data}
+  \small
+  \setlength{\tabcolsep}{3.8pt}
+  \begin{tabular}{@{}l r r r r r@{}}
+    \toprule
+    Set & Utts & Hrs & EN\% & CMI & Terms\\
+    \midrule
+    \multicolumn{6}{@{}l}{\textit{Training}}\\
+    GigaSpeech2 VN & 200k & 161.0 & -- & -- & --\\
+    RCS & 83.2k & 55.6 & 15.5 & 18.6 & 3{,}718\\
+    \midrule
+    \multicolumn{6}{@{}l}{\textit{Evaluation}}\\
+    VietnamTest & 66.6k & 51.5 & -- & -- & --\\
+    GigaSpeech2 CS & 1.5k & 3.9 & 5.5 & 6.0 & 1{,}217\\
+    ViMedCSS & 1.6k & 3.4 & 5.9 & 7.1 & 942\\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\subsection{Data and text evaluation}
+Real training speech comprises 200k Vietnamese utterances from
+GigaSpeech2~\cite{yang2025gigaspeech2}. The RCS catalog contains
+67 categories and 3,718 terms. From 50.6k source transcripts,
+we sample 83.2k synthetic utterances. Unless stated otherwise,
+RCS experiments use all 83.2k utterances with $\rho=0.2$.
+Evaluation uses GigaSpeech2 CS, the code-switching subset of the
+GigaSpeech2 dev set, medical-domain ViMedCSS~\cite{nguyen2026vimedcss},
+and the internal monolingual Vietnamese corpus VietnamTest
+(Table~\ref{tab:data});
+ViMedCSS terms are outside the augmentation catalog.
+
+
+\begin{table*}[t]
+  \centering
+  \caption{ASR results (\%). All RCS rows use mixed training;
+  Conformer RCS rows use $\rho=0.2$. LM: Vietnamese-only (mono),
+  or mono plus RCS transcripts (+RCS). Lex.: base, or base plus
+  respelled pronunciations (+resp.). Conformer rows with +RCS LM
+  change the LM and lexicon jointly.}
+  \label{tab:main}
+  \small
+  \setlength{\tabcolsep}{3.4pt}
+  \begin{tabular}{@{}l ccc ccc cc@{}}
+    \toprule
+    & \multicolumn{3}{c}{GigaSpeech2 CS}
+    & \multicolumn{3}{c}{ViMedCSS}
+    & \multicolumn{2}{c}{VietnamTest}\\
+    \cmidrule(lr){2-4}\cmidrule(lr){5-7}\cmidrule(l){8-9}
+    Training / decoder
+    & WER$\downarrow$ & CER$\downarrow$ & TR$\uparrow$
+    & WER$\downarrow$ & CER$\downarrow$ & TR$\uparrow$
+    & WER$\downarrow$ & CER$\downarrow$\\
+    \midrule
+    \multicolumn{9}{@{}l}{\textit{Whisper (fine-tuned)}}\\
+    Mono (200k)
+    & 20.76 & 10.72 & 29.24 & 33.15 & 22.70 & 11.76 & 25.80 & 15.62\\
+    +RCS 83.2k, $\rho=0$
+    & 18.42 & 9.41 & 39.18 & 32.57 & 21.91 & 14.62 & 23.54 & 14.08\\
+    +RCS 83.2k, $\rho=1$
+    & 19.03 & 9.69 & 33.21 & 33.08 & 22.24 & 11.93 & 24.06 & 14.39\\
+    +RCS 83.2k, $\rho=0.2$
+    & \textbf{16.10} & \textbf{7.90} & \textbf{45.30}
+    & \textbf{31.95} & \textbf{21.24} & \textbf{17.69}
+    & \textbf{22.70} & \textbf{13.50}\\
+    \midrule
+    \multicolumn{9}{@{}l}{\textit{Conformer-CTC + 4-gram LM (from scratch)}}\\
+    Mono / mono LM, base lex.
+    & 26.00 & 15.60 & 5.36 & 40.60 & 27.88 & 6.60 & 28.91 & 18.79\\
+    Mono / +RCS LM, +resp. lex.
+    & 23.32 & 15.26 & 10.12 & 40.50 & 26.59 & 8.10 & 28.81 & 17.89\\
+    +RCS / mono LM, base lex.
+    & 23.30 & 12.70 & 15.20 & 39.20 & 25.67 & 10.56 & 24.71 & 15.40\\
+    +RCS / +RCS LM, +resp. lex.
+    & \textbf{20.20} & \textbf{12.36} & \textbf{21.50}
+    & \textbf{37.12} & \textbf{24.17} & \textbf{15.69}
+    & \textbf{24.02} & \textbf{14.84}\\
+    \bottomrule
+  \end{tabular}
+\end{table*}
+
+For text evaluation, we compare RCS against LLM generation
+from scratch and a transformation prompt
+following~\cite{liu2026lens}, with 10k outputs per method.
+RCS utterances are shorter on average than GigaSpeech2 CS
+(2.4\,s versus 9.4\,s; 9.1 versus 37.8 words), and since
+EN\% and CMI are normalized by utterance length, their values
+in Table~\ref{tab:data} are not directly comparable; text
+comparisons therefore use length-matched real CS windows. We report PPL gap, CMI gap,
+MAUVE~\cite{pillutla2021mauve}, classifier two-sample test
+(C2ST)~\cite{lopezpaz2017c2st}, function-word switching,
+Vendi~\cite{friedman2023vendi}, and Self-BLEU.
+
+\subsection{ASR systems and evaluation}
+\textbf{Whisper}~\cite{radford2023whisper} denotes
+Whisper-large-v3-turbo, fully fine-tuned with AdamW.
+\textbf{Conformer-CTC}~\cite{gulati2020conformer,graves2006ctc}
+is trained from scratch on Vietnamese onset--rime--tone units
+and decoded with a 4-gram word LM and a pronunciation lexicon;
+the LM uses Vietnamese-only text (mono), or additionally
+the 83.2k RCS transcripts (+RCS), and +resp.\ adds
+Vietnamese-adapted lexicon entries. Checkpoints are selected
+by WER on the GigaSpeech2 Vietnamese dev set, disjoint from
+all test sets.
+
+We report WER, CER, and CS term recall (TR).
+Each utterance has a reference term list; a term is recovered
+only if its complete form appears in that utterance's
+hypothesis. TR measures recovery of reference terms and is
+interpreted alongside WER, which also penalizes insertions.
+We compare real-only training (Mono), sequential adaptation
+on synthetic speech (Mono$\rightarrow$CS), and mixed
+training on $\cD_{\rm mono}\cup\cD_{\rm syn}$ (Mix).
+Table~\ref{tab:main} uses Mix for all RCS configurations.
+
+\section{Results and discussion}
+\label{sec:results}
+\subsection{Text distribution and diversity}
+RCS is closest to the real-CS reference across the reported
+metrics (Table~\ref{tab:text}): its masked PPL gap is 0.07
+versus 0.17 for transformation and 0.68 for generation from
+scratch, MAUVE is 0.36 versus 0.21 and 0.03, and its
+function-word switching rate and Vendi score approach the
+reference (0.2\% vs.\ 0.3\%; 4.39 vs.\ 4.43). The higher CMI
+in Table~\ref{tab:data} reflects shorter utterances rather
+than denser switching, as length-matched windows give 17.9.
+
+C2ST remains above chance at 0.73, and these automatic
+metrics do not directly establish perceived naturalness.
+
+\subsection{ASR results across models and domains}
+On GigaSpeech2 CS, RCS with $\rho=0.2$ reduces Whisper WER
+from 20.76\% to 16.10\% (22.4\% relative) and increases TR
+from 29.24\% to 45.30\% (+16.06 percentage points).
+Canonical-only RCS already improves WER to 18.42\% and TR
+to 39.18\%; adding the mixed-pronunciation configuration
+yields a further 2.32-point WER reduction and 6.12-point
+TR increase. For Conformer-CTC with the mono LM and base lexicon held fixed, WER
+decreases from 26.00\% to 23.30\% and TR increases from 5.36\% to 15.20\%. Thus improvements
+are also observed with a recognizer trained from scratch
+and without decoder augmentation.
+
+On ViMedCSS, Whisper TR rises from 11.76\% to 17.69\%
+(+5.93 points), while WER decreases from 33.15\% to
+31.95\% (3.6\% relative); Conformer-CTC TR rises from
+6.60\% to 15.69\% and WER decreases from 40.60\% to
+37.12\%. This supports transfer beyond the augmentation
+catalog within the evaluated setting.
+Mixed training also improves Vietnamese-only recognition:
+VietnamTest WER decreases from 25.80\% to 22.70\%.
+
+\subsection{Training strategy and respelling}
+RCS is applied through mixed training, which avoids the
+monolingual degradation observed with sequential adaptation.
+Relative to no augmentation, adding RCS at $\rho=0.2$ improves
+both WER and CS term recall, and moderate respelling
+outperforms both canonical-only and always-respelled
+synthesis.
+
+\subsection{Decoder augmentation and data scale}
+Jointly adding RCS LM text and respelled lexicon entries
+further improves Conformer-CTC TR from 15.20\% to 21.50\%
+and WER from 23.30\% to 20.20\% on GigaSpeech2 CS.
+Applied to the Mono acoustic model, the same decoder update
+yields only 10.12\% TR, well below acoustic augmentation alone
+(15.20\%), and the two effects are roughly additive.
+The decoder comparison changes the LM and lexicon jointly
+and does not isolate the two components.
+For Whisper at $\rho=0.2$, TR rises from 29.24\%
+without synthetic data to 39.00\%, 42.60\%, and 45.30\%
+with 10k, 50k, and 83.2k utterances, respectively.
+It continues to improve over the evaluated range
+(Fig.~\ref{fig:scale}).
+The 10k configuration has numerically similar TR to
+83.2k canonical-only utterances (39.00\% versus 39.18\%).
+
+\begin{figure}[t]
+  \centering
+  \begin{tikzpicture}
+  \begin{axis}[
+      width=0.98\columnwidth,
+      height=3.15cm,
+      xlabel={Synthetic utterances},
+      ylabel={CS term recall (\%)},
+      xtick={0,10,50,83.2},
+      xticklabels={0,10k,50k,83.2k},
+      ymin=26, ymax=48,
+      ymajorgrids,
+      grid style={gray!25},
+      tick label style={font=\small},
+      label style={font=\small},
+      nodes near coords,
+      every node near coord/.append style={font=\small,anchor=south},
+  ]
+  \addplot+[mark=*, thick] coordinates {
+      (0,29.24) (10,39.00) (50,42.60) (83.2,45.30)
+  };
+  \end{axis}
+  \end{tikzpicture}
+  \vspace{-0.7em}
+  \caption{CS term recall of Whisper on GigaSpeech2 CS versus the number of
+synthetic utterances ($\rho{=}0.2$). All synthetic sets are drawn from the
+same monolingual source corpus.}
+  \label{fig:scale}
+  \vspace{-0.9em}
+\end{figure}
+
+The evaluation covers one language pair and one TTS model;
+matched ASR comparisons against alternative text generators
+are not included.
+
+\section{Conclusion}
+RCS constructs Vietnamese--English ASR training data by
+combining catalog-grounded slot editing of real transcripts
+with Vietnamese-adapted respelling. Mixed training improves
+the reported recognition metrics for Whisper and
+Conformer-CTC, including results on a Vietnamese-only test
+set. These results support RCS as a practical augmentation
+approach within
+the evaluated setting; broader downstream comparisons
+and perceptual validation remain open.
+
+\bibliographystyle{IEEEbib}
+\bibliography{refs}
+\end{document}
